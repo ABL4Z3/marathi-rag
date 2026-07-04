@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+data/uploads/*
+data/faiss_index/*
+data/manifest.json
+docx_extract
+*.ipynb
+*.zip
