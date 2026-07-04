@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List
 
@@ -109,6 +110,19 @@ DOMAIN_QUERY_TERMS = {
     "vacancies",
     "junior",
     "assistant",
+}
+
+QUERY_CORRECTIONS = {
+    "hte": "the",
+    "qulaities": "qualities",
+    "qulaity": "quality",
+    "adress": "address",
+    "resarch": "research",
+    "mosquitp": "mosquito",
+    "mosquitofusion": "mosquitofusion",
+    "og": "of",
+    "metodology": "methodology",
+    "methodolgy": "methodology",
 }
 
 
@@ -476,6 +490,35 @@ def _normalise_inline_text(text: str) -> str:
     return " ".join(text.split())
 
 
+def _normalise_query(question: str) -> str:
+    tokens = re.findall(r"\w+|[^\w\s]", question, flags=re.UNICODE)
+    corrected: list[str] = []
+    for token in tokens:
+        replacement = QUERY_CORRECTIONS.get(token.lower())
+        corrected.append(replacement if replacement else token)
+    text = " ".join(corrected)
+    text = re.sub(r"\s+([?.!,;:])", r"\1", text)
+    return text
+
+
+def _fuzzy_ratio(left: str, right: str) -> float:
+    return SequenceMatcher(None, left.lower(), right.lower()).ratio()
+
+
+def _source_relevance_score(question: str, source: str) -> float:
+    source_stem = Path(source).stem.lower().replace("_", " ").replace("-", " ")
+    question_lc = question.lower()
+    score = 0.0
+    for term in _query_terms(question):
+        if term in source_stem:
+            score += 0.35
+        elif len(term) >= 5:
+            score += max(0.0, _fuzzy_ratio(term, source_stem) - 0.55)
+    if source_stem and source_stem in question_lc:
+        score += 1.0
+    return score
+
+
 def _find_exam_centres_for_state(docs: list[Document], state: str = "gujarat") -> list[str]:
     combined = _normalise_inline_text("\n".join(doc.page_content for doc in docs))
     next_state = "maharashtra" if state.lower() == "gujarat" else ""
@@ -533,6 +576,7 @@ def _fallback_vacancy_answer(question: str, docs: list[Document]) -> str | None:
 
 
 def _is_research_section_question(question: str) -> str | None:
+    question = _normalise_query(question)
     question_lc = question.lower()
     if "abstract" in question_lc:
         return "abstract"
@@ -835,6 +879,7 @@ def _extract_resume_facts(text: str) -> dict[str, str]:
 
 
 def _resume_intent(question: str) -> str | None:
+    question = _normalise_query(question)
     q = question.lower()
     if any(marker in q for marker in ("father", "fathers", "parent", "पिता")):
         return "father"
@@ -1258,6 +1303,7 @@ def _all_indexed_documents(vector_store: FAISS) -> list[Document]:
 
 
 def _lexical_score(question: str, doc: Document) -> float:
+    question = _normalise_query(question)
     terms = _query_terms(question)
     if not terms:
         return 0.0
@@ -1288,6 +1334,7 @@ def _lexical_score(question: str, doc: Document) -> float:
     score += 2.0 * len(matched_entities)
     if requested_entities and len(matched_entities) == len(requested_entities):
         score += 0.8
+    score += _source_relevance_score(question, str(doc.metadata.get("source", "")))
 
     return score
 
@@ -1309,6 +1356,7 @@ def hybrid_retrieve_documents(
     dense_k: int = 32,
     lexical_k: int = 32,
 ) -> list[Document]:
+    question = _normalise_query(question)
     dense_results = vector_store.similarity_search_with_score(question, k=dense_k)
     all_docs = _all_indexed_documents(vector_store)
 
@@ -1340,7 +1388,42 @@ def hybrid_retrieve_documents(
         key=lambda key: (0.45 * dense_scores.get(key, 0.0)) + (0.55 * lexical_scores.get(key, 0.0)),
         reverse=True,
     )
-    return [docs_by_key[key] for key in ranked_keys[:final_k]]
+    return _expand_with_neighbor_chunks(vector_store, [docs_by_key[key] for key in ranked_keys[:final_k]], final_k)
+
+
+def _expand_with_neighbor_chunks(vector_store: FAISS, docs: list[Document], final_k: int) -> list[Document]:
+    all_docs = _all_indexed_documents(vector_store)
+    by_source_index: dict[tuple[str, int], Document] = {}
+    for doc in all_docs:
+        try:
+            chunk_index = int(doc.metadata.get("chunk_index", -9999))
+        except Exception:
+            continue
+        by_source_index[(str(doc.metadata.get("source", "")), chunk_index)] = doc
+
+    expanded: list[Document] = []
+    seen: set[tuple[str, int | str, int | str]] = set()
+    for doc in docs:
+        source = str(doc.metadata.get("source", ""))
+        try:
+            chunk_index = int(doc.metadata.get("chunk_index", -9999))
+        except Exception:
+            chunk_index = -9999
+
+        for candidate in (
+            by_source_index.get((source, chunk_index - 1)),
+            doc,
+            by_source_index.get((source, chunk_index + 1)),
+        ):
+            if not candidate:
+                continue
+            key = _doc_key(candidate)
+            if key not in seen:
+                expanded.append(candidate)
+                seen.add(key)
+            if len(expanded) >= final_k:
+                return expanded
+    return expanded
 
 
 def retrieve_context(vector_store: FAISS, question: str, k: int = 8) -> tuple[str, list[Document]]:
@@ -1354,6 +1437,7 @@ def retrieve_context(vector_store: FAISS, question: str, k: int = 8) -> tuple[st
 
 
 def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[str, str]]) -> tuple[str, list[Document]]:
+    question = _normalise_query(question)
     resume_answer = _fallback_resume_answer(vector_store, question)
     if resume_answer:
         return resume_answer
