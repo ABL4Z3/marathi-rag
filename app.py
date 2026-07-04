@@ -580,6 +580,12 @@ def _source_text_from_uploaded_file(source: str) -> str | None:
             doc = DocxDocument(str(source_path))
             parts = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
             return "\n".join(parts)
+        if suffix == ".pdf":
+            import fitz
+
+            pdf = fitz.open(source_path)
+            pages = [page.get_text("text").strip() for page in pdf if page.get_text("text").strip()]
+            return "\n".join(pages)
         if suffix in {".txt", ".md"}:
             return read_text_file(source_path.read_bytes())
     except Exception:
@@ -711,6 +717,187 @@ def _fallback_research_section_answer(vector_store: FAISS, question: str) -> tup
     ]
     docs.sort(key=lambda doc: int(doc.metadata.get("chunk_index", 0)))
     return answer, docs[:8] or [source_doc]
+
+
+def _resume_candidate_sources(vector_store: FAISS) -> list[str]:
+    sources: dict[str, int] = {}
+    for doc in _all_indexed_documents(vector_store):
+        source = str(doc.metadata.get("source", ""))
+        text = doc.page_content.lower()
+        if (
+            "resume" in source.lower()
+            or "career objective" in text
+            or "personal details" in text
+            or "father" in text
+            or "technical skills" in text
+            or "strengths" in text
+        ):
+            sources[source] = sources.get(source, 0) + 1
+    return sorted(sources, key=sources.get, reverse=True)
+
+
+def _source_docs(vector_store: FAISS, source: str) -> list[Document]:
+    docs = [
+        doc
+        for doc in _all_indexed_documents(vector_store)
+        if doc.metadata.get("source") == source
+    ]
+    docs.sort(key=lambda doc: int(doc.metadata.get("chunk_index", 0)))
+    return docs
+
+
+def _resume_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _extract_resume_facts(text: str) -> dict[str, str]:
+    facts: dict[str, str] = {}
+    lines = _resume_lines(text)
+    inline = _normalise_inline_text(text)
+
+    phone_match = re.search(r"(?:\+?\d[\d\s\-]{8,}\d)", inline)
+    if phone_match:
+        facts["phone"] = phone_match.group(0).strip()
+
+    email_match = re.search(r"[\w.+-]+@[\w.-]+\.\w+", inline)
+    if email_match:
+        facts["email"] = email_match.group(0).strip()
+
+    father_matches = list(re.finditer(
+        r"Father[’']?s\s*Name\s*:\s*(.+?)(?:Date\s*of\s*Birth|Gender|Marital|Nationality|Languages|$)",
+        inline,
+        flags=re.IGNORECASE,
+    ))
+    if father_matches:
+        father_values = [match.group(1).strip(" •|") for match in father_matches]
+        facts["father"] = max(father_values, key=lambda value: (value.count(" "), len(value)))
+
+    address_matches = list(re.finditer(
+        r"(Vill\.\s*.+?)(?:Career\s*Objective|Education|$)",
+        inline,
+        flags=re.IGNORECASE,
+    ))
+    if address_matches:
+        address_values = [match.group(1).strip(" •|") for match in address_matches]
+        facts["address"] = max(address_values, key=lambda value: (value.count(" "), len(value)))
+    else:
+        for index, line in enumerate(lines):
+            if "@" in line or re.search(r"\+?\d[\d\s\-]{8,}\d", line):
+                address_parts: list[str] = []
+                for following in lines[index + 1 : index + 5]:
+                    if re.search(r"career\s*objective|education|experience", following, flags=re.IGNORECASE):
+                        break
+                    address_parts.append(following)
+                if address_parts:
+                    facts["address"] = " ".join(address_parts)
+                    break
+
+    strengths_lines: list[str] = []
+    collecting_strengths = False
+    stop_headings = {
+        "personal details",
+        "declaration",
+        "career objective",
+        "education",
+        "experience",
+        "technical skills",
+        "academic achievement",
+    }
+    for line in lines:
+        clean_line = line.strip(" •\t")
+        line_lc = clean_line.lower()
+        if line_lc == "strengths":
+            collecting_strengths = True
+            strengths_lines = []
+            continue
+        if collecting_strengths:
+            if line_lc in stop_headings or "@" in clean_line or re.search(r"\+?\d[\d\s\-]{8,}\d", clean_line):
+                break
+            if clean_line and len(clean_line.split()) >= 3:
+                strengths_lines.append(clean_line)
+    if strengths_lines:
+        facts["qualities"] = "; ".join(dict.fromkeys(strengths_lines))
+
+    skills_match = re.search(
+        r"Soft\s*Skills\s*:\s*(.+?)(?:Strengths|Personal\s*Details|Declaration|$)",
+        inline,
+        flags=re.IGNORECASE,
+    )
+    if skills_match:
+        facts["soft_skills"] = skills_match.group(1).strip(" •|")
+
+    if lines:
+        first_line = next((line for line in lines if not line.startswith("+") and "@" not in line), "")
+        if first_line and len(first_line.split()) <= 4:
+            facts["name"] = first_line
+
+    return facts
+
+
+def _resume_intent(question: str) -> str | None:
+    q = question.lower()
+    if any(marker in q for marker in ("father", "fathers", "parent", "पिता")):
+        return "father"
+    if any(marker in q for marker in ("address", "addr", "पता")) or q.strip() in {"address", "addr"}:
+        return "address"
+    if any(marker in q for marker in ("phone", "mobile", "contact", "number", "no")):
+        return "phone"
+    if "email" in q or "mail" in q:
+        return "email"
+    if any(marker in q for marker in ("qualities", "quality", "qulaities", "strength", "strengths", "soft skill")):
+        return "qualities"
+    if any(marker in q for marker in ("name", "candidate")):
+        return "name"
+    return None
+
+
+def _fallback_resume_answer(vector_store: FAISS, question: str) -> tuple[str, list[Document]] | None:
+    intent = _resume_intent(question)
+    if not intent:
+        return None
+
+    for source in _resume_candidate_sources(vector_store):
+        docs = _source_docs(vector_store, source)
+        if not docs:
+            continue
+        for doc in docs:
+            facts = _extract_resume_facts(doc.page_content)
+            citation = _source_citation(doc)
+
+            if intent == "phone" and facts.get("phone"):
+                return f"Phone number: {facts['phone']}. {citation}", docs[:4]
+            if intent == "email" and facts.get("email"):
+                return f"Email: {facts['email']}. {citation}", docs[:4]
+            if intent == "father" and facts.get("father"):
+                return f"Father's name: {facts['father']}. {citation}", docs[:4]
+            if intent == "address" and facts.get("address") and facts["address"].count(" ") >= 2:
+                return f"Address: {facts['address']}. {citation}", docs[:4]
+            if intent == "qualities":
+                if facts.get("qualities"):
+                    return f"Qualities/strengths: {facts['qualities']}. {citation}", docs[:4]
+            if intent == "name" and facts.get("name"):
+                return f"Name: {facts['name']}. {citation}", docs[:4]
+
+        full_text = _source_text_from_uploaded_file(source) or "\n".join(doc.page_content for doc in docs)
+        facts = _extract_resume_facts(full_text)
+        citation = _source_citation(docs[0])
+
+        if intent == "phone" and facts.get("phone"):
+            return f"Phone number: {facts['phone']}. {citation}", docs[:4]
+        if intent == "email" and facts.get("email"):
+            return f"Email: {facts['email']}. {citation}", docs[:4]
+        if intent == "father" and facts.get("father"):
+            return f"Father's name: {facts['father']}. {citation}", docs[:4]
+        if intent == "address" and facts.get("address"):
+            return f"Address: {facts['address']}. {citation}", docs[:4]
+        if intent == "qualities":
+            qualities = facts.get("qualities") or facts.get("soft_skills")
+            if qualities:
+                return f"Qualities/strengths: {qualities}. {citation}", docs[:4]
+        if intent == "name" and facts.get("name"):
+            return f"Name: {facts['name']}. {citation}", docs[:4]
+
+    return None
 
 
 def _contains_devanagari(text: str) -> bool:
@@ -1167,6 +1354,10 @@ def retrieve_context(vector_store: FAISS, question: str, k: int = 8) -> tuple[st
 
 
 def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[str, str]]) -> tuple[str, list[Document]]:
+    resume_answer = _fallback_resume_answer(vector_store, question)
+    if resume_answer:
+        return resume_answer
+
     research_section_answer = _fallback_research_section_answer(vector_store, question)
     if research_section_answer:
         return research_section_answer
