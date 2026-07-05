@@ -531,7 +531,7 @@ def _detect_fee_types(text: str) -> list[str]:
 
 def _amount_matches(text: str) -> list[tuple[str, int]]:
     patterns = (
-        r"(?:rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?",
+        r"(?:rs\.?|inr|\u20b9)\s*[\d,]+(?:\.\d{1,2})?",
         r"\b[\d]{1,3}(?:,[\d]{3})+(?:\.\d{1,2})?\b",
     )
     matches: list[tuple[str, int]] = []
@@ -547,21 +547,15 @@ def _amount_matches(text: str) -> list[tuple[str, int]]:
 
 
 def _amounts_in_text(text: str) -> list[str]:
-    patterns = (
-        r"(?:rs\.?|inr|₹)\s*[\d,]+(?:\.\d{1,2})?",
-        r"\b[\d]{1,3}(?:,[\d]{3})+(?:\.\d{1,2})?\b",
-    )
     amounts: list[str] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            amount = match.group(0).strip()
-            if amount not in amounts:
-                amounts.append(amount)
+    for amount, _position in _amount_matches(text):
+        if amount not in amounts:
+            amounts.append(amount)
     return amounts
 
 
 def _normalise_amount(amount: str) -> str:
-    amount = amount.replace("₹", "Rs. ").strip()
+    amount = amount.replace("\u20b9", "Rs. ").strip()
     if not re.match(r"(?i)^(rs\.?|inr)\b", amount):
         amount = f"Rs. {amount}"
     return re.sub(r"\s+", " ", amount)
@@ -581,6 +575,9 @@ def _amounts_for_fee_type(text: str, fee_type: str) -> list[str]:
     if not matches:
         return []
 
+    if fee_type == "fee_structure":
+        return [matches[0][0]]
+
     positions = _keyword_positions(text.lower(), fee_type)
     if not positions:
         return [matches[0][0]]
@@ -591,7 +588,7 @@ def _amounts_for_fee_type(text: str, fee_type: str) -> list[str]:
         if after_keyword:
             chosen.append(after_keyword[0][0])
     if not chosen:
-        chosen.append(matches[0][0])
+        return []
 
     unique: list[str] = []
     for amount in chosen:
@@ -836,8 +833,16 @@ def _is_fee_question(question: str) -> bool:
 
 
 def _requested_fee_types(question: str) -> list[str]:
+    question_lc = question.lower()
     fee_types = _detect_fee_types(question)
-    if "fee_structure" not in fee_types and any(term in question.lower() for term in ("fee", "fees", "structure")):
+    specific_fee_types = [fee_type for fee_type in fee_types if fee_type != "fee_structure"]
+    explicit_fee_structure = any(
+        phrase in question_lc
+        for phrase in ("fee structure", "course fee", "total fee", "annual fee", "semester fee")
+    )
+    if specific_fee_types and not explicit_fee_structure:
+        return specific_fee_types
+    if "fee_structure" not in fee_types and any(term in question_lc for term in ("fee", "fees", "structure")):
         fee_types.append("fee_structure")
     return fee_types or ["fee_structure"]
 
@@ -877,6 +882,27 @@ def _fee_refusal(requested_programs: list[str], available_programs: list[str]) -
     )
 
 
+def _fee_type_text(fee_types: list[str]) -> str:
+    return ", ".join(_fee_type_label(fee_type) for fee_type in fee_types)
+
+
+def _fee_type_refusal(requested_programs: list[str], requested_fee_types: list[str]) -> str:
+    program_text = ", ".join(requested_programs)
+    fee_text = _fee_type_text(requested_fee_types)
+    return (
+        f"I found fee records for {program_text}, but not a clearly supported {fee_text} record. "
+        f"I cannot answer that fee type from these documents."
+    )
+
+
+def _fee_record_refusal(requested_programs: list[str]) -> str:
+    program_text = ", ".join(requested_programs)
+    return (
+        f"I found the requested program ({program_text}) in the uploaded documents, "
+        "but I could not extract a clearly supported fee record for it."
+    )
+
+
 def _fallback_fee_answer(vector_store: FAISS, question: str) -> tuple[str, list[Document]] | None:
     question = _normalise_query(question)
     if not _is_fee_question(question):
@@ -890,6 +916,8 @@ def _fallback_fee_answer(vector_store: FAISS, question: str) -> tuple[str, list[
     if not records:
         if requested_programs and available_programs and not any(program in available_programs for program in requested_programs):
             return _fee_refusal(requested_programs, available_programs), _all_indexed_documents(vector_store)[:4]
+        if requested_programs and available_programs and any(program in available_programs for program in requested_programs):
+            return _fee_record_refusal(requested_programs), _all_indexed_documents(vector_store)[:4]
         return None
 
     if requested_programs:
@@ -900,6 +928,8 @@ def _fallback_fee_answer(vector_store: FAISS, question: str) -> tuple[str, list[
             and record["fee_type"] in requested_fee_types
         ]
         if not matching_records:
+            if any(program in available_programs for program in requested_programs):
+                return _fee_type_refusal(requested_programs, requested_fee_types), _all_indexed_documents(vector_store)[:4]
             return _fee_refusal(requested_programs, available_programs), _all_indexed_documents(vector_store)[:4]
     else:
         matching_records = [

@@ -132,6 +132,50 @@ def build_fee_store():
     return build_vector_store(build_chunks(docs))
 
 
+def build_btech_tuition_only_store():
+    doc = Document(
+        page_content=(
+            "B.Tech Admission Fee Notice 2026-27\n"
+            "Fee Structure\n"
+            "B.Tech tuition fee: \u20b988,000 per year.\n"
+            "No hostel fee is listed in this notice."
+        ),
+        metadata={"source": "BTech_fee_notice.pdf", "page": 1, "file_type": "pdf"},
+    )
+    docs = [doc]
+    metadata = infer_document_metadata(docs)
+    records = extract_fee_records(docs, metadata)
+    save_document_metadata(metadata)
+    save_fee_records(records)
+    return build_vector_store(build_chunks(docs))
+
+
+def build_multi_program_fee_store():
+    docs = [
+        Document(
+            page_content=(
+                "B.Tech Fee Structure 2026-27\n"
+                "B.Tech course fee: Rs. 88,000.\n"
+                "B.Tech hostel fee: Rs. 12,000."
+            ),
+            metadata={"source": "BTech_fee_notice.pdf", "page": 1, "file_type": "pdf"},
+        ),
+        Document(
+            page_content=(
+                "MBA Fee Structure 2026-27\n"
+                "MBA course fee: Rs. 95,000.\n"
+                "MBA hostel fee: Rs. 18,000."
+            ),
+            metadata={"source": "MBA_fee_notice.pdf", "page": 1, "file_type": "pdf"},
+        ),
+    ]
+    metadata = infer_document_metadata(docs)
+    records = extract_fee_records(docs, metadata)
+    save_document_metadata(metadata)
+    save_fee_records(records)
+    return build_vector_store(build_chunks(docs))
+
+
 def main() -> None:
     vector_store = build_eval_store()
     passed = 0
@@ -187,6 +231,20 @@ def main() -> None:
     march_answer, _ = answer_question(fee_store, "tell me the fee structure of M.Arch and its hostel fee", [])
     march_ok = all(term.lower() in march_answer.lower() for term in ("m.arch", "73,200", "27,000"))
     print(f"{'PASS' if march_ok else 'FAIL'} fee_positive_march: {' '.join(march_answer.split())}")
+
+    btech_tuition_store = build_btech_tuition_only_store()
+    rupee_answer, _ = answer_question(btech_tuition_store, "what is the B.Tech tuition fee", [])
+    rupee_ok = "b.tech" in rupee_answer.lower() and "88,000" in rupee_answer
+    print(f"{'PASS' if rupee_ok else 'FAIL'} fee_rupee_symbol_btech: {' '.join(rupee_answer.split())}")
+
+    missing_hostel_answer, _ = answer_question(btech_tuition_store, "what is the B.Tech hostel fee", [])
+    missing_hostel_ok = "not a clearly supported hostel fee" in missing_hostel_answer.lower()
+    print(f"{'PASS' if missing_hostel_ok else 'FAIL'} fee_missing_type_btech: {' '.join(missing_hostel_answer.split())}")
+
+    multi_fee_store = build_multi_program_fee_store()
+    ambiguous_answer, _ = answer_question(multi_fee_store, "what is the hostel fee", [])
+    ambiguous_ok = "multiple programs" in ambiguous_answer.lower() and "specify the program" in ambiguous_answer.lower()
+    print(f"{'PASS' if ambiguous_ok else 'FAIL'} fee_ambiguous_multi_program: {' '.join(ambiguous_answer.split())}")
 
 
 if __name__ == "__main__":
