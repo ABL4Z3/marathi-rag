@@ -176,6 +176,36 @@ def build_multi_program_fee_store():
     return build_vector_store(build_chunks(docs))
 
 
+def build_marathi_notice_store():
+    doc = Document(
+        page_content=(
+            "एम.प्लॅन प्रथम वर्ष निवड यादी सूचना\n"
+            "ही सूचना एम.प्लॅन प्रथम वर्ष प्रवेशासाठी निवड झालेल्या विद्यार्थ्यांसाठी जारी करण्यात आली आहे.\n"
+            "निवड झालेल्या विद्यार्थ्यांचा निकाल PBEL 3.0 पोर्टलवर उपलब्ध करून देण्यात आला आहे."
+        ),
+        metadata={"source": "selected_mplan.pdf", "page": 1, "file_type": "pdf"},
+    )
+    return build_vector_store(build_chunks([doc]))
+
+
+def build_marathi_fee_store():
+    doc = Document(
+        page_content=(
+            "एम.आर्क प्रथम वर्ष सत्र 2026-27 फी नोटीस\n"
+            "ही फी नोटीस एम.आर्क अभ्यासक्रमासाठी आहे.\n"
+            "कॉलेज व विद्यापीठ शुल्क: \u20b973,200\n"
+            "वसतिगृह शुल्क: \u20b927,000"
+        ),
+        metadata={"source": "march_fee_26_27.pdf", "page": 1, "file_type": "pdf"},
+    )
+    docs = [doc]
+    metadata = infer_document_metadata(docs)
+    records = extract_fee_records(docs, metadata)
+    save_document_metadata(metadata)
+    save_fee_records(records)
+    return build_vector_store(build_chunks(docs))
+
+
 def main() -> None:
     vector_store = build_eval_store()
     passed = 0
@@ -245,6 +275,24 @@ def main() -> None:
     ambiguous_answer, _ = answer_question(multi_fee_store, "what is the hostel fee", [])
     ambiguous_ok = "multiple programs" in ambiguous_answer.lower() and "specify the program" in ambiguous_answer.lower()
     print(f"{'PASS' if ambiguous_ok else 'FAIL'} fee_ambiguous_multi_program: {' '.join(ambiguous_answer.split())}")
+
+    marathi_notice_store = build_marathi_notice_store()
+    notice_answer, _ = answer_question(
+        marathi_notice_store,
+        "ही सूचना कोणत्या विद्यार्थ्यांसाठी जारी करण्यात आली आहे? निकाल कोणत्या पोर्टलवर उपलब्ध करून देण्यात आला आहे?",
+        [],
+    )
+    notice_ok = "एम.प्लॅन" in notice_answer and "PBEL 3.0" in notice_answer and "पोर्टल" in notice_answer
+    print(f"{'PASS' if notice_ok else 'FAIL'} marathi_notice_students_portal: {' '.join(notice_answer.split())}")
+
+    marathi_fee_store = build_marathi_fee_store()
+    marathi_fee_answer, _ = answer_question(
+        marathi_fee_store,
+        "ही फी नोटीस कोणत्या अभ्यासक्रमासाठी आहे? कॉलेज व विद्यापीठ शुल्क किती आहे?",
+        [],
+    )
+    marathi_fee_ok = "M.Arch" in marathi_fee_answer and "73,200" in marathi_fee_answer
+    print(f"{'PASS' if marathi_fee_ok else 'FAIL'} marathi_fee_course_college_university: {' '.join(marathi_fee_answer.split())}")
 
 
 if __name__ == "__main__":

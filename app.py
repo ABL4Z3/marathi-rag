@@ -130,8 +130,10 @@ QUERY_CORRECTIONS = {
 PROGRAM_ALIASES = {
     "B.Tech": (r"\bb\s*\.?\s*tech\b", r"\bbachelor\s+of\s+technology\b", r"\bb\.?e\.?\s*/\s*b\.?tech\b"),
     "B.E.": (r"\bb\.\s*e\.?\b", r"\bb\s+e\b", r"\bbachelor\s+of\s+engineering\b", r"\bb\.?e\.?\s*/\s*b\.?tech\b"),
-    "M.Arch": (r"\bm\s*\.?\s*arch\b", r"\bmaster\s+of\s+architecture\b"),
+    "M.Arch": (r"\bm\.\s*arch\b", r"\bm\s+arch\b", r"\bmarch[_\-]", r"\bmaster\s+of\s+architecture\b", r"एम\.?\s*आर्क"),
     "B.Arch": (r"\bb\s*\.?\s*arch\b", r"\bbachelor\s+of\s+architecture\b"),
+    "M.Plan": (r"\bm\s*\.?\s*plan\b", r"\bmplan\b", r"\bmaster\s+of\s+planning\b", r"एम\.?\s*प्लॅन", r"एम\.?\s*प्लान"),
+    "B.Plan": (r"\bb\s*\.?\s*plan\b", r"\bbplan\b", r"\bbachelor\s+of\s+planning\b", r"बी\.?\s*प्लॅन", r"बी\.?\s*प्लान"),
     "MBA": (r"\bmba\b", r"\bm\.?b\.?a\.?\b", r"\bmaster\s+of\s+business\s+administration\b"),
     "MCA": (r"\bmca\b", r"\bm\.?c\.?a\.?\b", r"\bmaster\s+of\s+computer\s+applications\b"),
     "M.Tech": (r"\bm\s*\.?\s*tech\b", r"\bmaster\s+of\s+technology\b"),
@@ -141,12 +143,14 @@ PROGRAM_ALIASES = {
 }
 
 FEE_TYPE_KEYWORDS = {
-    "hostel_fee": ("hostel", "hostel fee", "hostel charges"),
-    "tuition_fee": ("tuition", "tuition fee"),
-    "caution_money": ("caution", "caution money"),
-    "security_deposit": ("security", "security money", "security deposit"),
-    "development_fee": ("development", "development fee"),
-    "fee_structure": ("fee structure", "total fee", "course fee", "annual fee", "semester fee", "fee"),
+    "hostel_fee": ("hostel", "hostel fee", "hostel charges", "वसतिगृह", "वसतिगृह शुल्क", "हॉस्टेल", "हॉस्टेल फी"),
+    "tuition_fee": ("tuition", "tuition fee", "शिक्षण शुल्क", "ट्यूशन फी"),
+    "college_fee": ("college fee", "college fees", "college and university fee", "college & university fee", "कॉलेज शुल्क", "कॉलेज व विद्यापीठ शुल्क", "कॉलेज आणि विद्यापीठ शुल्क", "महाविद्यालय शुल्क"),
+    "university_fee": ("university fee", "university fees", "college and university fee", "college & university fee", "विद्यापीठ शुल्क", "कॉलेज व विद्यापीठ शुल्क", "कॉलेज आणि विद्यापीठ शुल्क"),
+    "caution_money": ("caution", "caution money", "सावधनता ठेव", "कौशन मनी"),
+    "security_deposit": ("security", "security money", "security deposit", "सुरक्षा ठेव", "सिक्युरिटी"),
+    "development_fee": ("development", "development fee", "विकास शुल्क"),
+    "fee_structure": ("fee structure", "total fee", "course fee", "annual fee", "semester fee", "fee", "फी संरचना", "फी", "शुल्क"),
 }
 
 STRUCTURED_QUERY_TERMS = {
@@ -160,6 +164,12 @@ STRUCTURED_QUERY_TERMS = {
     "money",
     "structure",
     "amount",
+    "फी",
+    "शुल्क",
+    "वसतिगृह",
+    "विद्यापीठ",
+    "कॉलेज",
+    "महाविद्यालय",
 }
 
 
@@ -466,7 +476,7 @@ def _detect_programs(text: str) -> list[str]:
 
 def _detect_document_type(text: str) -> str:
     text_lc = text.lower()
-    if any(term in text_lc for term in ("fee structure", "hostel fee", "caution money", "tuition fee")):
+    if any(term in text_lc for term in ("fee structure", "hostel fee", "caution money", "tuition fee", "फी", "शुल्क")):
         return "fee"
     if "cutoff" in text_lc or "cut off" in text_lc:
         return "cutoff"
@@ -611,7 +621,28 @@ def extract_fee_records(documents: list[Document], document_metadata: list[dict]
         windows = lines + [_normalise_inline_text(doc.page_content)]
 
         for text in windows:
-            if not any(term in text.lower() for term in ("fee", "hostel", "caution", "security", "tuition", "deposit", "rs", "₹", "inr")):
+            if not any(
+                term in text.lower()
+                for term in (
+                    "fee",
+                    "hostel",
+                    "caution",
+                    "security",
+                    "tuition",
+                    "deposit",
+                    "college",
+                    "university",
+                    "rs",
+                    "₹",
+                    "inr",
+                    "फी",
+                    "शुल्क",
+                    "वसतिगृह",
+                    "विद्यापीठ",
+                    "कॉलेज",
+                    "महाविद्यालय",
+                )
+            ):
                 continue
             amount_matches = _amount_matches(text)
             fee_types = _detect_fee_types(text)
@@ -743,6 +774,10 @@ def _normalise_inline_text(text: str) -> str:
 
 
 def _normalise_query(question: str) -> str:
+    if _contains_devanagari(question):
+        text = re.sub(r"\s+", " ", question).strip()
+        return re.sub(r"\s+([?.!,;:।])", r"\1", text)
+
     tokens = re.findall(r"\w+|[^\w\s]", question, flags=re.UNICODE)
     corrected: list[str] = []
     for token in tokens:
@@ -829,7 +864,27 @@ def _fallback_vacancy_answer(question: str, docs: list[Document]) -> str | None:
 
 def _is_fee_question(question: str) -> bool:
     q = question.lower()
-    return any(term in q for term in ("fee", "fees", "hostel", "tuition", "caution", "security", "deposit"))
+    return any(
+        term in q
+        for term in (
+            "fee",
+            "fees",
+            "hostel",
+            "tuition",
+            "caution",
+            "security",
+            "deposit",
+            "college",
+            "university",
+            "फी",
+            "शुल्क",
+            "वसतिगृह",
+            "हॉस्टेल",
+            "विद्यापीठ",
+            "कॉलेज",
+            "महाविद्यालय",
+        )
+    )
 
 
 def _requested_fee_types(question: str) -> list[str]:
@@ -838,11 +893,11 @@ def _requested_fee_types(question: str) -> list[str]:
     specific_fee_types = [fee_type for fee_type in fee_types if fee_type != "fee_structure"]
     explicit_fee_structure = any(
         phrase in question_lc
-        for phrase in ("fee structure", "course fee", "total fee", "annual fee", "semester fee")
+        for phrase in ("fee structure", "course fee", "total fee", "annual fee", "semester fee", "फी संरचना")
     )
     if specific_fee_types and not explicit_fee_structure:
         return specific_fee_types
-    if "fee_structure" not in fee_types and any(term in question_lc for term in ("fee", "fees", "structure")):
+    if "fee_structure" not in fee_types and any(term in question_lc for term in ("fee", "fees", "structure", "फी", "शुल्क")):
         fee_types.append("fee_structure")
     return fee_types or ["fee_structure"]
 
@@ -871,6 +926,22 @@ def _programs_from_metadata(metadata: list[dict]) -> list[str]:
 
 def _fee_type_label(fee_type: str) -> str:
     return fee_type.replace("_", " ")
+
+
+def _localized_fee_type_label(fee_type: str, language: str) -> str:
+    if language == "mr":
+        labels = {
+            "hostel_fee": "वसतिगृह शुल्क",
+            "tuition_fee": "शिक्षण शुल्क",
+            "college_fee": "कॉलेज शुल्क",
+            "university_fee": "विद्यापीठ शुल्क",
+            "caution_money": "कौशन मनी",
+            "security_deposit": "सुरक्षा ठेव",
+            "development_fee": "विकास शुल्क",
+            "fee_structure": "फी",
+        }
+        return labels.get(fee_type, _fee_type_label(fee_type))
+    return _fee_type_label(fee_type)
 
 
 def _fee_refusal(requested_programs: list[str], available_programs: list[str]) -> str:
@@ -948,10 +1019,15 @@ def _fallback_fee_answer(vector_store: FAISS, question: str) -> tuple[str, list[
         key = (record["program"], record["fee_type"])
         grouped.setdefault(key, record)
 
+    language = _detect_question_language(question)
     lines = []
+    if language == "mr" and any(marker in question for marker in ("अभ्यासक्रम", "कोणत्या अभ्यासक्रम", "नोटीस")):
+        programs = ", ".join(sorted({record["program"] for record in matching_records}))
+        lines.append(f"ही फी नोटीस {programs} अभ्यासक्रमासाठी आहे.")
     for (_program, _fee_type), record in grouped.items():
+        fee_label = _localized_fee_type_label(record["fee_type"], language)
         lines.append(
-            f"{record['program']} {_fee_type_label(record['fee_type'])}: {record['amount']} "
+            f"{record['program']} {fee_label}: {record['amount']} "
             f"[{record['source']} p.{record['page']}]"
         )
 
@@ -1690,6 +1766,67 @@ def _fallback_marathi_answer(question: str, docs: list[Document]) -> str | None:
     return None
 
 
+def _line_contexts(docs: list[Document]) -> list[tuple[str, Document]]:
+    contexts: list[tuple[str, Document]] = []
+    for doc in docs:
+        raw_lines = [line.strip(" |") for line in doc.page_content.splitlines() if line.strip(" |")]
+        for index, line in enumerate(raw_lines):
+            previous_line = raw_lines[index - 1] if index > 0 else ""
+            next_line = raw_lines[index + 1] if index + 1 < len(raw_lines) else ""
+            contexts.append((" ".join(part for part in (previous_line, line, next_line) if part), doc))
+    return contexts
+
+
+def _find_notice_context(docs: list[Document], markers: tuple[str, ...]) -> tuple[str, Document] | None:
+    for context, doc in _line_contexts(docs):
+        context_lc = context.lower()
+        if any(marker.lower() in context_lc for marker in markers):
+            return context, doc
+    return None
+
+
+def _clean_notice_context(text: str) -> str:
+    text = _normalise_inline_text(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" |")
+
+
+def _fallback_notice_answer(question: str, docs: list[Document]) -> str | None:
+    if not docs or not _contains_devanagari(question):
+        return None
+
+    q = question.lower()
+    wants_students = any(marker in q for marker in ("विद्यार्थ", "students", "जारी"))
+    wants_portal = any(marker in q for marker in ("पोर्टल", "portal", "संकेतस्थळ", "website"))
+    wants_course = any(marker in q for marker in ("अभ्यासक्रम", "course", "program", "programme"))
+    if not any((wants_students, wants_portal, wants_course)):
+        return None
+
+    answers: list[str] = []
+    if wants_students:
+        match = _find_notice_context(docs, ("विद्यार्थ्यांसाठी", "विद्यार्थी", "students"))
+        if match:
+            context, doc = match
+            answers.append(f"सूचना विद्यार्थ्यांबाबतचा मजकूर: {_clean_notice_context(context)} {_source_citation(doc)}")
+
+    if wants_portal:
+        match = _find_notice_context(docs, ("पोर्टल", "portal", "संकेतस्थळ", "website"))
+        if match:
+            context, doc = match
+            answers.append(f"निकाल/माहिती पोर्टलबाबतचा मजकूर: {_clean_notice_context(context)} {_source_citation(doc)}")
+
+    if wants_course:
+        programs: list[str] = []
+        for doc in docs:
+            for program in _detect_programs(str(doc.metadata.get("source", "")) + "\n" + doc.page_content):
+                if program not in programs:
+                    programs.append(program)
+        if programs:
+            answers.append(f"ही नोटीस {', '.join(programs)} अभ्यासक्रमासाठी आहे. {_source_citation(docs[0])}")
+
+    return "\n".join(answers) if answers else None
+
+
 def _focused_excerpt(question: str, doc: Document, max_chars: int = 360) -> str:
     text = _normalise_inline_text(doc.page_content)
     text_lc = text.lower()
@@ -1708,6 +1845,7 @@ def _focused_excerpt(question: str, doc: Document, max_chars: int = 360) -> str:
 def build_fallback_answer(question: str, docs: list[Document]) -> str:
     direct_answer = (
         _fallback_marathi_answer(question, docs)
+        or _fallback_notice_answer(question, docs)
         or _fallback_exam_centre_answer(question, docs)
         or _fallback_vacancy_answer(question, docs)
     )
@@ -2002,6 +2140,7 @@ def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[
 
     direct_answer = (
         _fallback_marathi_answer(resolved_question, docs)
+        or _fallback_notice_answer(resolved_question, docs)
         or _fallback_exam_centre_answer(resolved_question, docs)
         or _fallback_vacancy_answer(resolved_question, docs)
     )
