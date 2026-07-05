@@ -10,6 +10,10 @@ from app import (
     Document,
     extract_docx_documents,
     extract_pdf_documents,
+    extract_fee_records,
+    infer_document_metadata,
+    save_document_metadata,
+    save_fee_records,
 )
 
 
@@ -109,6 +113,25 @@ def build_followup_store():
     return build_vector_store(build_chunks([doc]))
 
 
+def build_fee_store():
+    doc = Document(
+        page_content=(
+            "M.Arch. 1st Year session 2026-27\n"
+            "Fee Structure\n"
+            "M.Arch fee: Rs. 73,200 with caution money Rs. 5,000.\n"
+            "Hostel fee: Rs. 27,000 with security money Rs. 2,000.\n"
+            "This fee notice is for M.Arch students only."
+        ),
+        metadata={"source": "MArch_fee_notice.pdf", "page": 1, "file_type": "pdf"},
+    )
+    docs = [doc]
+    metadata = infer_document_metadata(docs)
+    records = extract_fee_records(docs, metadata)
+    save_document_metadata(metadata)
+    save_fee_records(records)
+    return build_vector_store(build_chunks(docs))
+
+
 def main() -> None:
     vector_store = build_eval_store()
     passed = 0
@@ -155,6 +178,15 @@ def main() -> None:
     followup_answer, _ = answer_question(followup_store, "explain me the week 3", history)
     followup_ok = all(term in followup_answer.lower() for term in ("week 3", "campaign", "follow"))
     print(f"{'PASS' if followup_ok else 'FAIL'} followup_week_3: {' '.join(followup_answer.split())}")
+
+    fee_store = build_fee_store()
+    btech_answer, _ = answer_question(fee_store, "tell me the fee structure of btech and its hostel fee", [])
+    btech_ok = "not b.tech" in btech_answer.lower() or "cannot answer b.tech" in btech_answer.lower()
+    print(f"{'PASS' if btech_ok else 'FAIL'} fee_mismatch_btech_from_march: {' '.join(btech_answer.split())}")
+
+    march_answer, _ = answer_question(fee_store, "tell me the fee structure of M.Arch and its hostel fee", [])
+    march_ok = all(term.lower() in march_answer.lower() for term in ("m.arch", "73,200", "27,000"))
+    print(f"{'PASS' if march_ok else 'FAIL'} fee_positive_march: {' '.join(march_answer.split())}")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 INDEX_DIR = DATA_DIR / "faiss_index"
 MANIFEST_PATH = DATA_DIR / "manifest.json"
 TESSDATA_DIR = Path(os.getenv("APP_TESSDATA_DIR", DATA_DIR / "tessdata"))
+DOCUMENT_METADATA_PATH = DATA_DIR / "document_metadata.json"
+FEE_RECORDS_PATH = DATA_DIR / "fee_records.json"
 
 load_dotenv(ENV_PATH, override=True)
 
@@ -123,6 +125,41 @@ QUERY_CORRECTIONS = {
     "og": "of",
     "metodology": "methodology",
     "methodolgy": "methodology",
+}
+
+PROGRAM_ALIASES = {
+    "B.Tech": (r"\bb\s*\.?\s*tech\b", r"\bbachelor\s+of\s+technology\b", r"\bb\.?e\.?\s*/\s*b\.?tech\b"),
+    "B.E.": (r"\bb\.\s*e\.?\b", r"\bb\s+e\b", r"\bbachelor\s+of\s+engineering\b", r"\bb\.?e\.?\s*/\s*b\.?tech\b"),
+    "M.Arch": (r"\bm\s*\.?\s*arch\b", r"\bmaster\s+of\s+architecture\b"),
+    "B.Arch": (r"\bb\s*\.?\s*arch\b", r"\bbachelor\s+of\s+architecture\b"),
+    "MBA": (r"\bmba\b", r"\bm\.?b\.?a\.?\b", r"\bmaster\s+of\s+business\s+administration\b"),
+    "MCA": (r"\bmca\b", r"\bm\.?c\.?a\.?\b", r"\bmaster\s+of\s+computer\s+applications\b"),
+    "M.Tech": (r"\bm\s*\.?\s*tech\b", r"\bmaster\s+of\s+technology\b"),
+    "M.E.": (r"\bm\.\s*e\.?\b", r"\bm\s+e\b", r"\bmaster\s+of\s+engineering\b"),
+    "B.Pharm": (r"\bb\s*\.?\s*pharm\b", r"\bbachelor\s+of\s+pharmacy\b"),
+    "M.Pharm": (r"\bm\s*\.?\s*pharm\b", r"\bmaster\s+of\s+pharmacy\b"),
+}
+
+FEE_TYPE_KEYWORDS = {
+    "hostel_fee": ("hostel", "hostel fee", "hostel charges"),
+    "tuition_fee": ("tuition", "tuition fee"),
+    "caution_money": ("caution", "caution money"),
+    "security_deposit": ("security", "security money", "security deposit"),
+    "development_fee": ("development", "development fee"),
+    "fee_structure": ("fee structure", "total fee", "course fee", "annual fee", "semester fee", "fee"),
+}
+
+STRUCTURED_QUERY_TERMS = {
+    "fee",
+    "fees",
+    "hostel",
+    "tuition",
+    "caution",
+    "security",
+    "deposit",
+    "money",
+    "structure",
+    "amount",
 }
 
 
@@ -417,6 +454,194 @@ def build_chunks(documents: List[Document]) -> List[Document]:
     return chunks
 
 
+def _detect_programs(text: str) -> list[str]:
+    found: list[str] = []
+    for program, patterns in PROGRAM_ALIASES.items():
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns):
+            found.append(program)
+    if "B.Tech" in found and "B.E." in found:
+        found = [program for program in found if program != "B.E."]
+    return found
+
+
+def _detect_document_type(text: str) -> str:
+    text_lc = text.lower()
+    if any(term in text_lc for term in ("fee structure", "hostel fee", "caution money", "tuition fee")):
+        return "fee"
+    if "cutoff" in text_lc or "cut off" in text_lc:
+        return "cutoff"
+    if "seat matrix" in text_lc:
+        return "seat_matrix"
+    if "eligibility" in text_lc:
+        return "eligibility"
+    if "resume" in text_lc or "career objective" in text_lc:
+        return "resume"
+    if "research paper" in text_lc or "abstract" in text_lc:
+        return "research_paper"
+    return "general"
+
+
+def _infer_document_title(source: str, text: str) -> str:
+    for line in text.splitlines()[:12]:
+        clean_line = line.strip(" |")
+        if clean_line and len(clean_line) <= 140:
+            return clean_line
+    return Path(source).stem.replace("_", " ")
+
+
+def _infer_session(text: str) -> str | None:
+    match = re.search(r"(?:session|academic\s+year|year)\s*[:\-]?\s*(20\d{2}\s*[-–]\s*\d{2,4})", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).replace(" ", "")
+    match = re.search(r"\b(20\d{2}\s*[-–]\s*\d{2})\b", text)
+    return match.group(1).replace(" ", "") if match else None
+
+
+def infer_document_metadata(documents: list[Document]) -> list[dict]:
+    by_source: dict[str, list[Document]] = {}
+    for doc in documents:
+        by_source.setdefault(str(doc.metadata.get("source", "unknown")), []).append(doc)
+
+    metadata: list[dict] = []
+    for source, source_docs in by_source.items():
+        text = "\n".join(doc.page_content for doc in source_docs)
+        metadata.append(
+            {
+                "source": source,
+                "document_title": _infer_document_title(source, text),
+                "document_type": _detect_document_type(text),
+                "programs_detected": _detect_programs(source + "\n" + text),
+                "session": _infer_session(source + "\n" + text),
+                "pages": sorted({doc.metadata.get("page", 1) for doc in source_docs}),
+            }
+        )
+    return metadata
+
+
+def _detect_fee_types(text: str) -> list[str]:
+    text_lc = text.lower()
+    fee_types: list[str] = []
+    for fee_type, keywords in FEE_TYPE_KEYWORDS.items():
+        if any(keyword in text_lc for keyword in keywords):
+            fee_types.append(fee_type)
+    if not fee_types and re.search(r"(?:rs\.?|inr|₹)\s*[\d,]+", text_lc):
+        fee_types.append("fee_structure")
+    return fee_types
+
+
+def _amount_matches(text: str) -> list[tuple[str, int]]:
+    patterns = (
+        r"(?:rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?",
+        r"\b[\d]{1,3}(?:,[\d]{3})+(?:\.\d{1,2})?\b",
+    )
+    matches: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            amount = _normalise_amount(match.group(0).strip())
+            key = f"{amount}:{match.start()}"
+            if key not in seen:
+                matches.append((amount, match.start()))
+                seen.add(key)
+    return sorted(matches, key=lambda item: item[1])
+
+
+def _amounts_in_text(text: str) -> list[str]:
+    patterns = (
+        r"(?:rs\.?|inr|₹)\s*[\d,]+(?:\.\d{1,2})?",
+        r"\b[\d]{1,3}(?:,[\d]{3})+(?:\.\d{1,2})?\b",
+    )
+    amounts: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            amount = match.group(0).strip()
+            if amount not in amounts:
+                amounts.append(amount)
+    return amounts
+
+
+def _normalise_amount(amount: str) -> str:
+    amount = amount.replace("₹", "Rs. ").strip()
+    if not re.match(r"(?i)^(rs\.?|inr)\b", amount):
+        amount = f"Rs. {amount}"
+    return re.sub(r"\s+", " ", amount)
+
+
+def _keyword_positions(text_lc: str, fee_type: str) -> list[int]:
+    positions: list[int] = []
+    for keyword in FEE_TYPE_KEYWORDS.get(fee_type, ()):
+        position = text_lc.find(keyword)
+        if position >= 0:
+            positions.append(position)
+    return positions
+
+
+def _amounts_for_fee_type(text: str, fee_type: str) -> list[str]:
+    matches = _amount_matches(text)
+    if not matches:
+        return []
+
+    positions = _keyword_positions(text.lower(), fee_type)
+    if not positions:
+        return [matches[0][0]]
+
+    chosen: list[str] = []
+    for position in positions:
+        after_keyword = [match for match in matches if match[1] >= position]
+        if after_keyword:
+            chosen.append(after_keyword[0][0])
+    if not chosen:
+        chosen.append(matches[0][0])
+
+    unique: list[str] = []
+    for amount in chosen:
+        if amount not in unique:
+            unique.append(amount)
+    return unique
+
+
+def extract_fee_records(documents: list[Document], document_metadata: list[dict] | None = None) -> list[dict]:
+    metadata_by_source = {item["source"]: item for item in document_metadata or infer_document_metadata(documents)}
+    records: list[dict] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+
+    for doc in documents:
+        source = str(doc.metadata.get("source", "unknown"))
+        page = doc.metadata.get("page", 1)
+        source_meta = metadata_by_source.get(source, {})
+        source_programs = source_meta.get("programs_detected") or []
+        lines = [line.strip(" |") for line in doc.page_content.splitlines() if line.strip(" |")]
+        windows = lines + [_normalise_inline_text(doc.page_content)]
+
+        for text in windows:
+            if not any(term in text.lower() for term in ("fee", "hostel", "caution", "security", "tuition", "deposit", "rs", "₹", "inr")):
+                continue
+            amount_matches = _amount_matches(text)
+            fee_types = _detect_fee_types(text)
+            if not amount_matches or not fee_types:
+                continue
+            programs = _detect_programs(text) or source_programs
+            if not programs:
+                continue
+            for program in programs:
+                for fee_type in fee_types:
+                    for amount in _amounts_for_fee_type(text, fee_type):
+                        record = {
+                            "program": program,
+                            "fee_type": fee_type,
+                            "amount": amount,
+                            "currency": "INR",
+                            "notes": text[:260],
+                            "source": source,
+                            "page": page,
+                        }
+                        key = (record["program"], record["fee_type"], record["amount"], record["source"], str(record["page"]))
+                        if key not in seen:
+                            records.append(record)
+                            seen.add(key)
+    return records
+
+
 def persist_manifest(files: List[str], chunk_count: int) -> None:
     ensure_dirs()
     manifest = {
@@ -431,6 +656,36 @@ def load_manifest() -> dict:
     if MANIFEST_PATH.exists():
         return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     return {"files": [], "chunk_count": 0, "updated_at": None}
+
+
+def _read_json_file(path: Path, default):
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+
+def _write_json_file(path: Path, data) -> None:
+    ensure_dirs()
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_document_metadata() -> list[dict]:
+    return _read_json_file(DOCUMENT_METADATA_PATH, [])
+
+
+def save_document_metadata(metadata: list[dict]) -> None:
+    _write_json_file(DOCUMENT_METADATA_PATH, metadata)
+
+
+def load_fee_records() -> list[dict]:
+    return _read_json_file(FEE_RECORDS_PATH, [])
+
+
+def save_fee_records(records: list[dict]) -> None:
+    _write_json_file(FEE_RECORDS_PATH, records)
 
 
 def get_embeddings() -> HuggingFaceEmbeddings:
@@ -573,6 +828,135 @@ def _fallback_vacancy_answer(question: str, docs: list[Document]) -> str | None:
     source = source_doc.metadata.get("source", "unknown")
     page = source_doc.metadata.get("page", "?")
     return f"The Gujarat number of vacancies is Ahmedabad (1) and Rajkot (1), for a total of 2 Junior Assistant vacancies. [{source} p.{page}]"
+
+
+def _is_fee_question(question: str) -> bool:
+    q = question.lower()
+    return any(term in q for term in ("fee", "fees", "hostel", "tuition", "caution", "security", "deposit"))
+
+
+def _requested_fee_types(question: str) -> list[str]:
+    fee_types = _detect_fee_types(question)
+    if "fee_structure" not in fee_types and any(term in question.lower() for term in ("fee", "fees", "structure")):
+        fee_types.append("fee_structure")
+    return fee_types or ["fee_structure"]
+
+
+def _records_from_vector_store(vector_store: FAISS) -> tuple[list[dict], list[dict]]:
+    docs = _all_indexed_documents(vector_store)
+    metadata = infer_document_metadata(docs)
+    records = extract_fee_records(docs, metadata)
+    persisted_records = load_fee_records()
+    if persisted_records:
+        records = persisted_records
+    persisted_metadata = load_document_metadata()
+    if persisted_metadata:
+        metadata = persisted_metadata
+    return records, metadata
+
+
+def _programs_from_metadata(metadata: list[dict]) -> list[str]:
+    programs: list[str] = []
+    for item in metadata:
+        for program in item.get("programs_detected") or []:
+            if program not in programs:
+                programs.append(program)
+    return programs
+
+
+def _fee_type_label(fee_type: str) -> str:
+    return fee_type.replace("_", " ")
+
+
+def _fee_refusal(requested_programs: list[str], available_programs: list[str]) -> str:
+    requested_text = ", ".join(requested_programs)
+    available_text = ", ".join(available_programs) if available_programs else "other uploaded documents"
+    return (
+        f"I found fee information in the uploaded documents, but it appears to be for {available_text}, "
+        f"not {requested_text}. I cannot answer {requested_text} fees from these documents."
+    )
+
+
+def _fallback_fee_answer(vector_store: FAISS, question: str) -> tuple[str, list[Document]] | None:
+    question = _normalise_query(question)
+    if not _is_fee_question(question):
+        return None
+
+    requested_programs = _detect_programs(question)
+    requested_fee_types = _requested_fee_types(question)
+    records, metadata = _records_from_vector_store(vector_store)
+
+    available_programs = _programs_from_metadata(metadata) or sorted({record["program"] for record in records})
+    if not records:
+        if requested_programs and available_programs and not any(program in available_programs for program in requested_programs):
+            return _fee_refusal(requested_programs, available_programs), _all_indexed_documents(vector_store)[:4]
+        return None
+
+    if requested_programs:
+        matching_records = [
+            record
+            for record in records
+            if record["program"] in requested_programs
+            and record["fee_type"] in requested_fee_types
+        ]
+        if not matching_records:
+            return _fee_refusal(requested_programs, available_programs), _all_indexed_documents(vector_store)[:4]
+    else:
+        matching_records = [
+            record
+            for record in records
+            if record["fee_type"] in requested_fee_types
+        ]
+        if not matching_records:
+            return None
+        if len({record["program"] for record in matching_records}) > 1:
+            programs = ", ".join(sorted({record["program"] for record in matching_records}))
+            return f"I found fee records for multiple programs ({programs}). Please specify the program.", _all_indexed_documents(vector_store)[:4]
+
+    grouped: dict[tuple[str, str], dict] = {}
+    for record in matching_records:
+        key = (record["program"], record["fee_type"])
+        grouped.setdefault(key, record)
+
+    lines = []
+    for (_program, _fee_type), record in grouped.items():
+        lines.append(
+            f"{record['program']} {_fee_type_label(record['fee_type'])}: {record['amount']} "
+            f"[{record['source']} p.{record['page']}]"
+        )
+
+    source_docs = [
+        doc
+        for doc in _all_indexed_documents(vector_store)
+        if any(doc.metadata.get("source") == record["source"] for record in matching_records)
+    ]
+    return "\n".join(lines), source_docs[:8] or _all_indexed_documents(vector_store)[:4]
+
+
+def _answer_amounts(answer: str) -> list[str]:
+    return [_normalise_amount(amount) for amount in _amounts_in_text(answer)]
+
+
+def _verify_structured_claims(answer: str, question: str, vector_store: FAISS) -> str | None:
+    if not _is_fee_question(question) and not _amounts_in_text(answer):
+        return answer
+
+    answer_amounts = _answer_amounts(answer)
+    if not answer_amounts:
+        return answer
+
+    records, metadata = _records_from_vector_store(vector_store)
+    requested_programs = _detect_programs(question)
+    if requested_programs:
+        records = [record for record in records if record["program"] in requested_programs]
+        if not records:
+            return _fee_refusal(requested_programs, _programs_from_metadata(metadata))
+
+    record_amounts = {_normalise_amount(record["amount"]) for record in records}
+    unsupported = [amount for amount in answer_amounts if amount not in record_amounts]
+    if unsupported:
+        return None
+    return answer
 
 
 def _is_research_section_question(question: str) -> str | None:
@@ -1437,6 +1821,8 @@ def _lexical_score(question: str, doc: Document) -> float:
     question_lc = question.lower()
     requested_entities = [term for term in terms if term not in DOMAIN_QUERY_TERMS]
     matched_entities = [term for term in requested_entities if term in tokens or term in text]
+    requested_programs = _detect_programs(question)
+    doc_programs = _detect_programs(str(doc.metadata.get("source", "")) + "\n" + doc.page_content)
 
     if "exam" in question_lc and ("centre" in question_lc or "center" in question_lc):
         if "online examination centre" in text or "online examination center" in text:
@@ -1451,6 +1837,13 @@ def _lexical_score(question: str, doc: Document) -> float:
     score += 2.0 * len(matched_entities)
     if requested_entities and len(matched_entities) == len(requested_entities):
         score += 0.8
+    if _is_fee_question(question):
+        if requested_programs and any(program in doc_programs for program in requested_programs):
+            score += 2.5
+        elif requested_programs and doc_programs:
+            score -= 2.0
+        if any(term in text for term in ("fee", "hostel", "caution", "security", "tuition")):
+            score += 0.8
     score += _source_relevance_score(question, str(doc.metadata.get("source", "")))
 
     return score
@@ -1557,6 +1950,10 @@ def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[
     original_question = _normalise_query(question)
     resolved_question = _contextualize_question(original_question, chat_history)
 
+    fee_answer = _fallback_fee_answer(vector_store, resolved_question)
+    if fee_answer:
+        return fee_answer
+
     numbered_section_answer = _fallback_numbered_section_answer(vector_store, resolved_question, chat_history)
     if numbered_section_answer:
         return numbered_section_answer
@@ -1606,6 +2003,11 @@ def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[
             return build_fallback_answer(question, docs), docs
         if _looks_like_not_found(content):
             return content, docs
+        verified_content = _verify_structured_claims(content, resolved_question, vector_store)
+        if verified_content:
+            content = verified_content
+        else:
+            return _not_found_answer(original_question), docs
         if _answer_support_score(content, docs) < 0.35:
             return _not_found_answer(original_question), docs
         return content, docs
@@ -1634,6 +2036,21 @@ def render_sidebar() -> None:
             st.sidebar.write("Files:")
             for file_name in manifest["files"]:
                 st.sidebar.write(f"- {file_name}")
+        metadata = load_document_metadata()
+        fee_records = load_fee_records()
+        if metadata:
+            with st.sidebar.expander("Document diagnostics"):
+                for item in metadata:
+                    programs = ", ".join(item.get("programs_detected") or ["None"])
+                    st.write(f"**{item.get('source')}**")
+                    st.write(f"Type: {item.get('document_type')} | Programs: {programs}")
+        if fee_records:
+            with st.sidebar.expander(f"Fee records ({len(fee_records)})"):
+                for record in fee_records[:20]:
+                    st.write(
+                        f"{record['program']} | {record['fee_type']} | {record['amount']} "
+                        f"({record['source']} p.{record['page']})"
+                    )
     else:
         st.sidebar.info("No knowledge base built yet")
 
@@ -1648,6 +2065,10 @@ def render_sidebar() -> None:
                     shutil.rmtree(child)
         if MANIFEST_PATH.exists():
             MANIFEST_PATH.unlink()
+        if DOCUMENT_METADATA_PATH.exists():
+            DOCUMENT_METADATA_PATH.unlink()
+        if FEE_RECORDS_PATH.exists():
+            FEE_RECORDS_PATH.unlink()
         st.sidebar.success("Knowledge base cleared")
 
 
@@ -1700,11 +2121,21 @@ def main() -> None:
                     st.write(errors)
             else:
                 chunks = build_chunks(all_docs)
+                document_metadata = infer_document_metadata(all_docs)
+                fee_records = extract_fee_records(all_docs, document_metadata)
                 vector_store = build_vector_store(chunks)
                 save_vector_store(vector_store)
                 st.session_state.vector_store = vector_store
                 persist_manifest(uploaded_names, len(chunks))
+                save_document_metadata(document_metadata)
+                save_fee_records(fee_records)
                 st.success(f"Knowledge base built from {len(uploaded_names)} file(s) and {len(chunks)} chunk(s).")
+                if document_metadata:
+                    with st.expander("Detected document metadata", expanded=True):
+                        st.dataframe(pd.DataFrame(document_metadata), use_container_width=True)
+                if fee_records:
+                    with st.expander("Extracted fee records", expanded=True):
+                        st.dataframe(pd.DataFrame(fee_records), use_container_width=True)
                 if errors:
                     st.warning("Some files had issues:")
                     for error in errors:

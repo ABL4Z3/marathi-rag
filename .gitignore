@@ -10,6 +10,8 @@ data/uploads/
 data/faiss_index/
 data/tessdata/
 data/manifest.json
+data/document_metadata.json
+data/fee_records.json
 
 docx_extract/
 AI_Admission_Guidance_Platform_MVP_Spec.docx
