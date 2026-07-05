@@ -763,6 +763,123 @@ def _fallback_research_section_answer(vector_store: FAISS, question: str) -> tup
     return answer, docs[:8] or [source_doc]
 
 
+def _history_sources(chat_history: list[dict[str, str]]) -> list[str]:
+    sources: list[str] = []
+    for message in reversed(chat_history[-6:]):
+        for source in message.get("sources") or []:
+            source_name = str(source).split(" p.")[0].strip()
+            if source_name and source_name not in sources:
+                sources.append(source_name)
+    return sources
+
+
+def _recent_history_text(chat_history: list[dict[str, str]], max_messages: int = 4) -> str:
+    parts: list[str] = []
+    for message in chat_history[-max_messages:]:
+        content = _normalise_inline_text(str(message.get("content", "")))
+        if not content:
+            continue
+        if len(content) > 500:
+            content = content[:497] + "..."
+        parts.append(content)
+    return " ".join(parts)
+
+
+def _is_follow_up_question(question: str) -> bool:
+    q = question.lower().strip()
+    terms = _query_terms(q)
+    if len(terms) <= 4:
+        return True
+    follow_markers = (
+        "that",
+        "this",
+        "it",
+        "them",
+        "those",
+        "week",
+        "day",
+        "step",
+        "phase",
+        "round",
+        "module",
+        "explain",
+        "elaborate",
+        "tell me more",
+    )
+    return any(marker in q for marker in follow_markers)
+
+
+def _contextualize_question(question: str, chat_history: list[dict[str, str]]) -> str:
+    question = _normalise_query(question)
+    if not chat_history or not _is_follow_up_question(question):
+        return question
+    history_text = _recent_history_text(chat_history)
+    if not history_text:
+        return question
+    return f"{history_text}\nFollow-up question: {question}"
+
+
+def _timebox_section_request(question: str) -> tuple[str, str] | None:
+    q = question.lower()
+    patterns = (
+        ("week", r"\bweek\s*([0-9]+)\b"),
+        ("day", r"\bday\s*([0-9]+)\b"),
+        ("step", r"\bstep\s*([0-9]+)\b"),
+        ("phase", r"\bphase\s*([0-9]+)\b"),
+    )
+    for label, pattern in patterns:
+        matches = list(re.finditer(pattern, q))
+        if matches:
+            return label, matches[-1].group(1)
+    return None
+
+
+def _extract_numbered_section(full_text: str, label: str, number: str) -> str | None:
+    label_pattern = re.escape(label)
+    number_pattern = re.escape(number)
+    start_pattern = rf"\b{label_pattern}\s*{number_pattern}\b\s*[:.\-–—]?\s*"
+    start_match = re.search(start_pattern, full_text, flags=re.IGNORECASE)
+    if not start_match:
+        return None
+
+    next_pattern = rf"\b{label_pattern}\s*[0-9]+\b\s*[:.\-–—]?"
+    next_match = re.search(next_pattern, full_text[start_match.end() :], flags=re.IGNORECASE)
+    end = start_match.end() + next_match.start() if next_match else len(full_text)
+    section = full_text[start_match.start() : end]
+    return _normalise_inline_text(section)
+
+
+def _fallback_numbered_section_answer(
+    vector_store: FAISS,
+    question: str,
+    chat_history: list[dict[str, str]],
+) -> tuple[str, list[Document]] | None:
+    request = _timebox_section_request(question)
+    if not request:
+        return None
+
+    label, number = request
+    preferred_sources = _history_sources(chat_history)
+    all_sources = sorted({str(doc.metadata.get("source", "")) for doc in _all_indexed_documents(vector_store)})
+    candidate_sources = preferred_sources + [source for source in all_sources if source not in preferred_sources]
+
+    for source in candidate_sources:
+        full_text, source_doc = _ordered_source_text(vector_store, source)
+        if not full_text or not source_doc:
+            continue
+        section = _extract_numbered_section(full_text, label, number)
+        if not section:
+            continue
+
+        source_docs = _source_docs(vector_store, source)
+        citation = _source_citation(source_doc)
+        section = re.sub(rf"^\s*{re.escape(label)}\s*{re.escape(number)}\s*[:.\-–—]?\s*", "", section, flags=re.IGNORECASE)
+        answer = f"{label.title()} {number}: {_trim_section_answer(section, 220)} {citation}"
+        return answer, source_docs[:8] or [source_doc]
+
+    return None
+
+
 def _resume_candidate_sources(vector_store: FAISS) -> list[str]:
     sources: dict[str, int] = {}
     for doc in _all_indexed_documents(vector_store):
@@ -1437,34 +1554,43 @@ def retrieve_context(vector_store: FAISS, question: str, k: int = 8) -> tuple[st
 
 
 def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[str, str]]) -> tuple[str, list[Document]]:
-    question = _normalise_query(question)
-    resume_answer = _fallback_resume_answer(vector_store, question)
+    original_question = _normalise_query(question)
+    resolved_question = _contextualize_question(original_question, chat_history)
+
+    numbered_section_answer = _fallback_numbered_section_answer(vector_store, resolved_question, chat_history)
+    if numbered_section_answer:
+        return numbered_section_answer
+
+    resume_answer = _fallback_resume_answer(vector_store, resolved_question)
     if resume_answer:
         return resume_answer
 
-    research_section_answer = _fallback_research_section_answer(vector_store, question)
+    research_section_answer = _fallback_research_section_answer(vector_store, resolved_question)
     if research_section_answer:
         return research_section_answer
 
-    context, docs = retrieve_context(vector_store, question)
+    context, docs = retrieve_context(vector_store, resolved_question)
     if not docs:
         return "I could not find this in the uploaded documents.", []
 
     direct_answer = (
-        _fallback_marathi_answer(question, docs)
-        or _fallback_exam_centre_answer(question, docs)
-        or _fallback_vacancy_answer(question, docs)
+        _fallback_marathi_answer(resolved_question, docs)
+        or _fallback_exam_centre_answer(resolved_question, docs)
+        or _fallback_vacancy_answer(resolved_question, docs)
     )
     if direct_answer:
         return direct_answer, docs
 
-    if _retrieval_confidence(question, docs) < 0.5:
-        return _not_found_answer(question), docs
+    if _retrieval_confidence(resolved_question, docs) < 0.35:
+        return _not_found_answer(original_question), docs
 
     try:
         prompt = build_answer_prompt()
         chat_history_context = build_chat_history_context(chat_history)
-        messages = prompt.format_messages(question=question, context=context, chat_history=chat_history_context)
+        prompt_question = original_question
+        if resolved_question != original_question:
+            prompt_question = f"{original_question}\nResolved with chat context: {resolved_question}"
+        messages = prompt.format_messages(question=prompt_question, context=context, chat_history=chat_history_context)
         client = make_llm_client()
         response = client.chat.completions.create(
             model=os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
@@ -1481,7 +1607,7 @@ def answer_question(vector_store: FAISS, question: str, chat_history: list[dict[
         if _looks_like_not_found(content):
             return content, docs
         if _answer_support_score(content, docs) < 0.35:
-            return _not_found_answer(question), docs
+            return _not_found_answer(original_question), docs
         return content, docs
     except Exception as exc:  # pragma: no cover - demo UX path
         message = str(exc)

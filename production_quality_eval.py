@@ -7,6 +7,7 @@ from app import (
     answer_question,
     build_chunks,
     build_vector_store,
+    Document,
     extract_docx_documents,
     extract_pdf_documents,
 )
@@ -93,6 +94,21 @@ def build_eval_store():
     return build_vector_store(build_chunks(docs))
 
 
+def build_followup_store():
+    doc = Document(
+        page_content=(
+            "Cold Mailing Guide\n"
+            "Week 1: Research your target audience, build an ICP, and collect verified leads.\n"
+            "Week 2: Write short personalized cold email copy and prepare subject line variants.\n"
+            "Week 3: Launch the first campaign, send a small batch of personalized emails, "
+            "track open and reply rates, follow up with non-responders, and improve the message based on replies.\n"
+            "Week 4: Scale the campaign, test new segments, and document the winning templates."
+        ),
+        metadata={"source": "cold_mailing_guide.txt", "page": 1, "file_type": "txt"},
+    )
+    return build_vector_store(build_chunks([doc]))
+
+
 def main() -> None:
     vector_store = build_eval_store()
     passed = 0
@@ -125,6 +141,20 @@ def main() -> None:
     if refusal_total:
         print(f"refusal_accuracy={refusal_pass / refusal_total:.3f} ({refusal_pass}/{refusal_total})")
     print(f"hallucination_rate={hallucination_fail / total:.3f} ({hallucination_fail}/{total})")
+
+    followup_store = build_followup_store()
+    first_answer, first_docs = answer_question(followup_store, "What are the steps for cold mailing? Guide me week by week.", [])
+    history = [
+        {"role": "user", "content": "What are the steps for cold mailing? Guide me week by week."},
+        {
+            "role": "assistant",
+            "content": first_answer,
+            "sources": [f"{doc.metadata.get('source')} p.{doc.metadata.get('page')}" for doc in first_docs],
+        },
+    ]
+    followup_answer, _ = answer_question(followup_store, "explain me the week 3", history)
+    followup_ok = all(term in followup_answer.lower() for term in ("week 3", "campaign", "follow"))
+    print(f"{'PASS' if followup_ok else 'FAIL'} followup_week_3: {' '.join(followup_answer.split())}")
 
 
 if __name__ == "__main__":
